@@ -4,121 +4,145 @@ const { Redis } = require('@upstash/redis');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.use(express.json());
-app.use(cors());
 
-// متغيرات عالمية للاحتفاظ بالعملاء بعد التهيئة (Caching)
+// --- CORS CONFIGURATION ---
+const corsOptions = {
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps or curl)
+    if (!origin) return callback(null, true);
+    
+    const isEmergent = /\.emergent\.sh$/.test(origin);
+    const isLocal = /^http:\/\/localhost(:\d+)?$/.test(origin);
+    
+    if (isEmergent || isLocal) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true
+};
+
+app.use(cors(corsOptions));
+app.use(express.json());
+
+// --- LAZY INITIALIZATION CLIENTS ---
 let redisClient = null;
 let supabaseClient = null;
 
-/**
- * Lazy Initialization لعميل Redis
- */
 function getRedis() {
-    if (!redisClient) {
-        redisClient = new Redis({
-            url: process.env.UPSTASH_REDIS_REST_URL,
-            token: process.env.UPSTASH_REDIS_REST_TOKEN,
-        });
-    }
-    return redisClient;
+  if (!redisClient) {
+    redisClient = new Redis({
+      url: process.env.UPSTASH_REDIS_REST_URL,
+      token: process.env.UPSTASH_REDIS_REST_TOKEN,
+    });
+  }
+  return redisClient;
 }
 
-/**
- * Lazy Initialization لعميل Supabase
- */
 function getSupabase() {
-    if (!supabaseClient) {
-        supabaseClient = createClient(
-            process.env.SUPABASE_URL,
-            process.env.SUPABASE_ANON_KEY
-        );
-    }
-    return supabaseClient;
+  if (!supabaseClient) {
+    supabaseClient = createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_ANON_KEY
+    );
+  }
+  return supabaseClient;
 }
 
+// --- ROUTES ---
+
 /**
- * مسار الفحص GET /
+ * Health Check Path
  */
 app.get('/', (req, res) => {
-    res.status(200).json({
-        status: "Online",
-        service: "TRU Prevention System",
-        timestamp: new Date().toISOString()
-    });
+  res.status(200).json({
+    status: "active",
+    service: "TRU Double-Financing Prevention",
+    timestamp: new Date().toISOString()
+  });
 });
 
 /**
- * مسار القفل POST /api/lock
- * لمنع التمويل المزدوج باستخدام Atomic Locking
+ * POST /api/lock
+ * Core logic for preventing double financing using Atomic Locking
  */
 app.post('/api/lock', async (req, res) => {
-    const { nationalId, amount, requestId } = req.body;
+  // 1. Payload Compatibility Mapping
+  const nationalId = req.body.nationalId || req.body.hashedIdentity;
+  const guaranteeId = req.body.guaranteeId || req.body.hashedGuarantee;
+  const amount = req.body.amount || 0;
+  const metadata = req.body.metadata || {};
 
-    // 1. التحقق من البيانات المدخلة
-    if (!nationalId) {
-        return res.status(400).json({ error: "National ID is required" });
+  // 2. Strict Validation
+  if (!nationalId || !guaranteeId) {
+    return res.status(400).json({ 
+      error: "National ID and Guarantee ID are required" 
+    });
+  }
+
+  try {
+    const redis = getRedis();
+    const supabase = getSupabase();
+
+    // 3. Define Atomic Lock Key (Scoped to the Identity)
+    const lockKey = `tru:lock:identity:${nationalId}`;
+
+    // 4. Attempt Atomic SET with NX (Not Exists) and EX (Expire)
+    // TTL: 900 seconds = 15 minutes
+    const lockAcquired = await redis.set(lockKey, JSON.stringify({
+      gid: guaranteeId,
+      ts: Date.now()
+    }), {
+      nx: true,
+      ex: 900
+    });
+
+    // 5. Check if Lock Failed
+    if (!lockAcquired) {
+      return res.status(409).json({ 
+        error: "DOUBLE_FINANCING_ATTEMPT_BLOCKED" 
+      });
     }
 
-    try {
-        const redis = getRedis();
-        const supabase = getSupabase();
-
-        // مفتاح القفل الفريد (بناءً على رقم الهوية)
-        const lockKey = `lock:finance:${nationalId}`;
-
-        // 2. محاولة تفعيل القفل الذري (SET NX EX)
-        // NX: لا تضع القيمة إذا كان المفتاح موجوداً مسبقاً
-        // EX: تنتهي صلاحية القفل تلقائياً بعد 900 ثانية (15 دقيقة)
-        const isLocked = await redis.set(lockKey, "LOCKED", {
-            nx: true,
-            ex: 900
-        });
-
-        if (!isLocked) {
-            // إذا فشل القفل، فهذا يعني وجود عملية تمويل قائمة بالفعل
-            return res.status(409).json({
-                success: false,
-                message: "Double Financing Detected: Request already in progress for this ID.",
-                code: "DUPLICATE_FINANCE_ATTEMPT"
-            });
+    // 6. Asynchronous Audit Logging (verification_logs)
+    // We do not 'await' this to keep the response time near-instant, 
+    // ensuring the lock is the priority.
+    supabase
+      .from('verification_logs')
+      .insert([
+        {
+          national_id: nationalId,
+          guarantee_id: guaranteeId,
+          amount: amount,
+          status: 'LOCKED',
+          metadata: metadata,
+          created_at: new Date().toISOString()
         }
+      ])
+      .then(({ error }) => {
+        if (error) console.error("Supabase Audit Error:", error.message);
+      });
 
-        // 3. تسجيل العملية في سجل التدقيق (Supabase) بعد نجاح القفل
-        const { error: supabaseError } = await supabase
-            .from('audit_logs')
-            .insert([
-                { 
-                    national_id: nationalId, 
-                    amount: amount || 0, 
-                    request_id: requestId || 'N/A',
-                    status: 'LOCKED',
-                    created_at: new Date()
-                }
-            ]);
+    // 7. Success Response
+    return res.status(200).json({
+      success: true,
+      message: "Lock secured. Proceed with financing.",
+      identity: nationalId,
+      expires_in: "900s"
+    });
 
-        if (supabaseError) {
-            console.error("Supabase Audit Error:", supabaseError);
-            // ملاحظة: لا نلغي العملية هنا لأن القفل في Redis نجح بالفعل
-        }
-
-        // 4. رد بالنجاح
-        return res.status(200).json({
-            success: true,
-            message: "Lock acquired successfully. No double financing detected.",
-            lockExpiresIn: "900s"
-        });
-
-    } catch (error) {
-        console.error("Server Error:", error);
-        // تجنب انهيار السيرفر (Zero 500 Errors strategy)
-        return res.status(500).json({
-            success: false,
-            message: "Internal Server Error during verification",
-            error: error.message
-        });
-    }
+  } catch (error) {
+    console.error("Critical System Error:", error);
+    // Return 500 but keep it structured to avoid serverless crash
+    return res.status(500).json({ 
+      error: "INTERNAL_SERVER_ERROR",
+      message: error.message 
+    });
+  }
 });
 
-// تصدير التطبيق ليعمل كـ Vercel Serverless Function
+// Export for Vercel Serverless
 module.exports = app;
